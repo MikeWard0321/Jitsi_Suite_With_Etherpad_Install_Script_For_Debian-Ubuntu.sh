@@ -156,15 +156,15 @@ secure_mariadb() {
     check_command
 }
 
-# Function to install Jitsi Meet and Jigasi
+# Function to install Jitsi Meet and Jibri
 install_jitsi() {
-    log_message "Installing Jitsi Meet and Jigasi..." "INFO"
+    log_message "Installing Jitsi Meet and Jibri..." "INFO"
     sudo apt update
     sudo apt install apt-transport-https
     sudo wget -qO - https://download.jitsi.org/jitsi-key.gpg.key | sudo apt-key add -
     echo 'deb https://download.jitsi.org stable/' | sudo tee /etc/apt/sources.list.d/jitsi-stable.list
     sudo apt update
-    sudo apt -y install jitsi-meet jigasi
+    sudo apt -y install jitsi-meet jibri
     sudo /usr/share/jitsi-meet/scripts/install-letsencrypt-cert.sh
     configure_jitsi_nat $public_ip $local_ip
 }
@@ -177,10 +177,10 @@ configure_jitsi_nat() {
     restart_service "jitsi-videobridge2"
 }
 
-# Function to install Jibri
-install_jibri() {
-    log_message "Installing Jibri..." "INFO"
-    install_package "jibri"
+# Function to install Jigasi
+install_jigasi() {
+    log_message "Installing Jigasi..." "INFO"
+    install_package "jigasi"
 }
 
 # Function to install Etherpad
@@ -193,18 +193,27 @@ install_etherpad() {
     run_command "etherpad-lite/bin/run.sh &"
 }
 
+# Function to install recording service
+install_recording_service() {
+    log_message "Installing recording service..." "INFO"
+    install_package "jitsi-meet-tokens"
+    install_package "jitsi-meet-turnserver"
+    sudo apt -y install jitsi-meet-nginx
+    sudo /usr/share/jitsi-meet/scripts/install-letsencrypt-cert.sh
+}
+
 # Function to uninstall Jitsi
 uninstall_jitsi() {
     log_message "Uninstalling Jitsi..." "INFO"
-    sudo apt purge jitsi-meet jigasi -y
+    sudo apt purge jitsi-meet jibri jigasi -y
     sudo apt autoremove -y
     check_command
 }
 
-# Function to uninstall Jibri
-uninstall_jibri() {
-    log_message "Uninstalling Jibri..." "INFO"
-    sudo apt purge jibri -y
+# Function to uninstall Jigasi
+uninstall_jigasi() {
+    log_message "Uninstalling Jigasi..." "INFO"
+    sudo apt purge jigasi -y
     sudo apt autoremove -y
     check_command
 }
@@ -227,13 +236,22 @@ uninstall_etherpad() {
     check_command
 }
 
+# Function to uninstall recording service
+uninstall_recording_service() {
+    log_message "Uninstalling recording service..." "INFO"
+    sudo apt purge jitsi-meet-tokens jitsi-meet-turnserver jitsi-meet-nginx -y
+    sudo apt autoremove -y
+    check_command
+}
+
 # Function to reinstall a service
 reinstall_service() {
     local service=$1
     case $service in
         "jitsi") uninstall_jitsi; install_jitsi;;
-        "jibri") uninstall_jibri; install_jibri;;
+        "jigasi") uninstall_jigasi; install_jigasi;;
         "etherpad") uninstall_etherpad; install_etherpad;;
+        "recording") uninstall_recording_service; install_recording_service;;
         *) echo "Invalid service. Please try again.";;
     esac
 }
@@ -282,16 +300,19 @@ create_config_file() {
 display_menu() {
     echo "1. Create configuration file"
     echo "2. Install Jitsi"
-    echo "3. Install Jibri"
+    echo "3. Install Jigasi"
     echo "4. Install Etherpad"
-    echo "5. Uninstall Jitsi"
-    echo "6. Uninstall Jibri"
-    echo "7. Uninstall Etherpad"
-    echo "8. Reinstall Jitsi"
-    echo "9. Reinstall Jibri"
-    echo "10. Reinstall Etherpad"
-    echo "11. Exit"
-    local valid_options=("1" "2" "3" "4" "5" "6" "7" "8" "9" "10" "11")
+    echo "5. Install Recording Service"
+    echo "6. Uninstall Jitsi"
+    echo "7. Uninstall Jigasi"
+    echo "8. Uninstall Etherpad"
+    echo "9. Uninstall Recording Service"
+    echo "10. Reinstall Jitsi"
+    echo "11. Reinstall Jigasi"
+    echo "12. Reinstall Etherpad"
+    echo "13. Reinstall Recording Service"
+    echo "14. Exit"
+    local valid_options=("1" "2" "3" "4" "5" "6" "7" "8" "9" "10" "11" "12" "13" "14")
     while true; do
         read -p "Please select an option: " menu_option
         if [[ ! " ${valid_options[@]} " =~ " ${menu_option} " ]]; then
@@ -329,20 +350,23 @@ main() {
         case $menu_option in
             1) create_config_file;;
             2) read_config_file $CONFIG_FILE; install_jitsi;;
-            3) read_config_file $CONFIG_FILE; install_jibri;;
-            4) read_config_file $CONFIG_FILE; install_etherpad;;
-            5) read_config_file $CONFIG_FILE; uninstall_jitsi;;
-            6) read_config_file $CONFIG_FILE; uninstall_jibri;;
-            7) read_config_file $CONFIG_FILE; uninstall_etherpad;;
-            8) read_config_file $CONFIG_FILE; reinstall_service "jitsi";;
-            9) read_config_file $CONFIG_FILE; reinstall_service "jibri";;
-            10) read_config_file $CONFIG_FILE; reinstall_service "etherpad";;
-            11) break;;
+            3) read_config_file $CONFIG_FILE; read -p "Install Jigasi? (y/n): " install_jigasi_option; if [[ $install_jigasi_option == "y" ]]; then install_jigasi; fi;;
+             4) read_config_file $CONFIG_FILE; install_etherpad;;
+             5) read_config_file $CONFIG_FILE; install_recording_service;;
+            6) read_config_file $CONFIG_FILE; uninstall_jitsi;;
+            7) read_config_file $CONFIG_FILE; uninstall_jigasi;;
+            8) read_config_file $CONFIG_FILE; uninstall_etherpad;;
+             9) read_config_file $CONFIG_FILE; uninstall_recording_service;;
+            10) read_config_file $CONFIG_FILE; reinstall_service "jitsi";;
+            11) read_config_file $CONFIG_FILE; reinstall_service "jigasi";;
+            12) read_config_file $CONFIG_FILE; reinstall_service "etherpad";;
+            13) read_config_file $CONFIG_FILE; reinstall_service "recording";;
+            14) break;;
             *) echo "Invalid option. Please try again.";;
         esac
     done
 
-    # Get the current date and time
+    # Get the current date and time 
     end_time=$(date)
     # Print the end time
     log_message "Script ended at: $end_time" "INFO"
