@@ -1,24 +1,24 @@
 # Jitsi_Suite_With_Etherpad_Install_Script_For_Debian-Ubuntu.sh
 
-# Complete Jitsi, Jigasi, Jibri, Jicofo installation script with optional Etherpad installation and integration.
+# Complete Jitsi, Jigasi, Jibri, and Jicofo installation script with optional Etherpad installation and integration.
 
-# Due to the increase in demand for secure video and voice communications and some of the complexities in setting services up, I have decided to script the installation process, making it easier for others to deploy.
+# Due to the increased demand for secure video and voice communications and some of the complexities in setting up services, I have decided to script the installation process, making it easier for others to deploy.
 
 # This script will create a configuration file, which it will then use for setup. 
 
 # It will also ask the user if Jitsi is being installed behind NAT and will make and apply the appropriate configuration changes. 
 
-# It is intended to be run on Debian/Ubuntu, but can be easily modified for other systems. 
+# It is intended to be run on Debian/Ubuntu but can be easily modified for other systems. 
 
 # **The script ***MUST*** be downloaded to and run from the /root/ directory with sudo privileges or as root**
 
-# To run the script, use "sudo ./script-name.sh" from terminal. You may need to run "chmod +x script-name.sh" to make it executable. 
+# To run the script, use "sudo ./script-name.sh" from the terminal. You may need to run "chmod +x script-name.sh" to make it executable. 
 
 # You can also copy and paste the code below into your own file, make it executable, and run it as stated above. 
 
 # Feel free to fork or modify it as per your needs!
 
-*BEGIN SCRIPT*
+
 
 ```
 #!/usr/bin/env bash
@@ -375,5 +375,3 @@ main() {
 # Run the main function
 main
 ```
-
-*END SCRIPT*
