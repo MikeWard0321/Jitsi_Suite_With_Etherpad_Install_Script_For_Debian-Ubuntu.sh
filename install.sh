@@ -210,6 +210,9 @@ install_jitsi() {
         log_message "Server is not behind NAT; skipping NAT harvester configuration."
     fi
     log_message "Jitsi Meet installation complete."
+    log_message "NEXT STEPS: open firewall ports 80/tcp, 443/tcp, 10000/udp (and 22/tcp for SSH)," "WARN"
+    log_message "and enable the secure domain so only authorized users can create rooms." "WARN"
+    log_message "See the README (Firewall configuration / Authentication sections) for details." "WARN"
 }
 
 # --- Jigasi -----------------------------------------------------------------
