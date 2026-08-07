@@ -530,7 +530,7 @@ add_prosody_user() {
     # prosodyctl register is idempotent-ish: it errors if the user exists, so
     # try register and fall back to passwd.
     if ! prosodyctl register "$user" "$fqdn" "$password" 2>/dev/null; then
-        prosodyctl passwd "$user" "$fqdn" <<EOF || die "Failed to set password for ${user}@${fqdn}."
+        prosodyctl passwd "${user}@${fqdn}" <<EOF || die "Failed to set password for ${user}@${fqdn}."
 $password
 $password
 EOF
@@ -600,12 +600,12 @@ setup_jibri_accounts() {
     recorder_pw=$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | head -c 20)
 
     prosodyctl register jibri "auth.${fqdn}" "$jibri_pw" 2>/dev/null || \
-        prosodyctl passwd jibri "auth.${fqdn}" <<EOF
+        prosodyctl passwd "jibri@auth.${fqdn}" <<EOF
 $jibri_pw
 $jibri_pw
 EOF
     prosodyctl register recorder "recorder.${fqdn}" "$recorder_pw" 2>/dev/null || \
-        prosodyctl passwd recorder "recorder.${fqdn}" <<EOF
+        prosodyctl passwd "recorder@recorder.${fqdn}" <<EOF
 $recorder_pw
 $recorder_pw
 EOF
