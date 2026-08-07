@@ -1,353 +1,398 @@
 #!/usr/bin/env bash
+#
+# Jitsi Suite (Meet, Jicofo, Videobridge, Jibri) + optional Jigasi and Etherpad
+# installer for Debian/Ubuntu.
+#
+# Must be run as root, e.g.:  sudo ./install.sh
+#
+# The script is menu driven. Create the configuration file first (option 1),
+# then install the components you need.
 
-set -e
-# set -x
+set -euo pipefail
 
-# Define paths as variables
-JITSI_MEET_PATH="/etc/jitsi/meet/"
-PROSODY_CONF_PATH="/etc/prosody/conf.avail/"
+# --- Constants --------------------------------------------------------------
+VIDEOBRIDGE_PROPS="/etc/jitsi/videobridge/sip-communicator.properties"
+KEYRING_DIR="/etc/apt/keyrings"
+JITSI_KEYRING="${KEYRING_DIR}/jitsi.gpg"
+JITSI_SOURCES="/etc/apt/sources.list.d/jitsi-stable.list"
 
-# Define log file
 LOG_FILE="/var/log/jitsi_script.log"
-
-# Define config file
 CONFIG_FILE="/etc/jitsi_script.conf"
 
-# Function to log messages
+ETHERPAD_USER="etherpad"
+ETHERPAD_HOME="/opt/etherpad"
+ETHERPAD_REPO="https://github.com/ether/etherpad-lite.git"
+ETHERPAD_SERVICE="/etc/systemd/system/etherpad.service"
+
+# Configuration values (populated by read_config_file).
+local_ip=""
+public_ip=""
+fqdn=""
+behind_nat="no"
+
+# --- Logging / error handling ----------------------------------------------
+# A single, consistent error strategy: `set -e` aborts on any unchecked
+# failure and the ERR trap records what failed. `die` is used for explicit,
+# validated error conditions.
 log_message() {
     local message=$1
-    local level=$2
-    echo "$(date): [$level] $message" >> $LOG_FILE
+    local level=${2:-INFO}
+    local line
+    line="$(date '+%Y-%m-%d %H:%M:%S'): [$level] $message"
+    # Never let a logging failure abort the script.
+    echo "$line" >>"$LOG_FILE" 2>/dev/null || true
+    echo "$line"
 }
 
-# Function to display error messages
-display_error() {
-    local message=$1
-    echo "Error: $message" >> "$LOG_FILE"
-    echo "Error: $message"
+die() {
+    log_message "$1" "ERROR"
     exit 1
 }
 
-# Function to check if a command succeeded
-check_command() {
-    if [[ $? -ne 0 ]]; then
-        display_error "Command failed: $BASH_COMMAND"
+on_error() {
+    local exit_code=$?
+    log_message "Command failed (exit ${exit_code}): ${BASH_COMMAND}" "ERROR"
+    exit "$exit_code"
+}
+trap on_error ERR
+
+require_root() {
+    if [[ ${EUID} -ne 0 ]]; then
+        die "This script must be run as root (try: sudo $0)."
     fi
 }
 
-# Function to check if a file exists
-check_file() {
-    local file=$1
-    if [[ ! -f $file ]]; then
-        display_error "File not found: $file"
-    fi
-}
-
-# Function to check if a directory exists
-check_directory() {
-    local directory=$1
-    if [[ ! -d $directory ]]; then
-        display_error "Directory not found: $directory"
-    fi
-}
-
-# Function to install a package and check if it was installed successfully
+# --- Generic helpers --------------------------------------------------------
 install_package() {
-    local package=$1
-    sudo apt install "$package" -y
-    check_command
+    apt-get install -y "$@"
 }
 
-# Function to start a service and check if it started successfully
-start_service() {
-    local service=$1
-    if ! systemctl is-enabled --quiet "$service"; then
-        sudo systemctl start "$service"
-        check_command
-    else
-        log_message "Service $service is already running. Skipping start." "INFO"
-    fi
+service_exists() {
+    systemctl list-unit-files "${1}.service" --no-legend 2>/dev/null | grep -q "^${1}.service"
 }
 
-# Function to restart a service and check if it restarted successfully
 restart_service() {
     local service=$1
-    if systemctl is-enabled --quiet "$service"; then
-        sudo systemctl restart "$service"
-        check_command
+    if service_exists "$service"; then
+        systemctl restart "$service"
+        log_message "Restarted service: $service"
     else
-        log_message "Service $service is not running. Skipping restart." "INFO"
+        log_message "Service $service not found; skipping restart." "WARN"
     fi
 }
 
-# Function to download a file and check if it was downloaded successfully
-download_file() {
-    local url=$1
-    local file=$2
-    wget "$url" -O "$file"
-    check_command
-    check_file "$file"
-}
-
-# Function to append a line to a file
-append_to_file() {
-    local line=$1
-    local file=$2
-    echo "$line" | sudo tee -a "$file" > /dev/null
-    check_command
-}
-
-# Function to replace a placeholder in a file
-replace_placeholder() {
-    local placeholder=$1
-    local replacement=$2
-    local file=$3
-    # Use a different delimiter for sed, e.g., #
-    sudo sed -i "s#$placeholder#$replacement#g" "$file"
-    check_command
-}
-
-# Function to clone a git repository and check if it was cloned successfully
-clone_repo() {
-    local url=$1
-    local directory=$2
-    git clone "$url" "$directory"
-    check_command
-    check_directory "$directory"
-}
-
-# Function to run a command and check if it ran successfully
-run_command() {
-    local command=$1
-    $command
-    check_command
-}
-
-# Function to secure MariaDB installation
-secure_mariadb() {
-    log_message "Securing MariaDB installation..." "INFO"
-    sudo mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$root_password';"
-    sudo mysql -e "DELETE FROM mysql.user WHERE User='';"
-    sudo mysql -e "FLUSH PRIVILEGES;"
-    sudo mysql_secure_installation
-    check_command
-}
-
-# Function to install Jitsi Meet and Jibri
-install_jitsi() {
-    log_message "Installing Jitsi Meet and Jibri..." "INFO"
-    sudo apt update
-    sudo apt install apt-transport-https
-    sudo wget -qO - https://download.jitsi.org/jitsi-key.gpg.key | sudo apt-key add -
-    echo 'deb https://download.jitsi.org stable/' | sudo tee /etc/apt/sources.list.d/jitsi-stable.list
-    sudo apt update
-    sudo apt -y install jitsi-meet jibri
-    sudo /usr/share/jitsi-meet/scripts/install-letsencrypt-cert.sh
-    configure_jitsi_nat $public_ip $local_ip
-}
-
-# Function to configure Jitsi Meet behind NAT
-configure_jitsi_nat() {
-    log_message "Configuring Jitsi Meet for NAT..." "INFO"
-    replace_placeholder "org.ice4j.ice.harvest.NAT_HARVESTER_LOCAL_ADDRESS=" "org.ice4j.ice.harvest.NAT_HARVESTER_LOCAL_ADDRESS=$local_ip" /etc/jitsi/videobridge/sip-communicator.properties
-    replace_placeholder "org.ice4j.ice.harvest.NAT_HARVESTER_PUBLIC_ADDRESS=" "org.ice4j.ice.harvest.NAT_HARVESTER_PUBLIC_ADDRESS=$public_ip" /etc/jitsi/videobridge/sip-communicator.properties
-    restart_service "jitsi-videobridge2"
-}
-
-# Function to install Jigasi
-install_jigasi() {
-    log_message "Installing Jigasi..." "INFO"
-    install_package "jigasi"
-}
-
-# Function to install Etherpad
-install_etherpad() {
-    log_message "Installing Etherpad..." "INFO"
-    install_package "nodejs"
-    install_package "git"
-    # Create Etherpad user and clone Etherpad repository
-    create_user_and_clone_repo "etherpad" "https://github.com/ether/etherpad-lite.git" "etherpad-lite"
-    run_command "etherpad-lite/bin/run.sh &"
-}
-
-# Function to install recording service
-install_recording_service() {
-    log_message "Installing recording service..." "INFO"
-    install_package "jitsi-meet-tokens"
-    install_package "jitsi-meet-turnserver"
-    sudo apt -y install jitsi-meet-nginx
-    sudo /usr/share/jitsi-meet/scripts/install-letsencrypt-cert.sh
-}
-
-# Function to uninstall Jitsi
-uninstall_jitsi() {
-    log_message "Uninstalling Jitsi..." "INFO"
-    sudo apt purge jitsi-meet jibri jigasi -y
-    sudo apt autoremove -y
-    check_command
-}
-
-# Function to uninstall Jigasi
-uninstall_jigasi() {
-    log_message "Uninstalling Jigasi..." "INFO"
-    sudo apt purge jigasi -y
-    sudo apt autoremove -y
-    check_command
-}
-
-# Function to uninstall Etherpad
-uninstall_etherpad() {
-    log_message "Uninstalling Etherpad..." "INFO"
-    sudo apt purge nodejs -y
-    sudo apt purge git -y
-    sudo rm -rf /usr/local/lib/node_modules
-    sudo rm -rf /usr/local/bin/node
-    sudo rm -rf /usr/local/share/man/man1/node.1
-    sudo rm -rf /usr/local/lib/dtrace/node.d
-    sudo rm -rf ~/.npm
-    sudo rm -rf ~/.node-gyp
-    sudo rm -rf /opt/local/bin/node
-    sudo rm -rf /opt/local/include/node
-    sudo rm -rf /opt/local/lib/node_modules
-    sudo apt autoremove -y
-    check_command
-}
-
-# Function to uninstall recording service
-uninstall_recording_service() {
-    log_message "Uninstalling recording service..." "INFO"
-    sudo apt purge jitsi-meet-tokens jitsi-meet-turnserver jitsi-meet-nginx -y
-    sudo apt autoremove -y
-    check_command
-}
-
-# Function to reinstall a service
-reinstall_service() {
-    local service=$1
-    case $service in
-        "jitsi") uninstall_jitsi; install_jitsi;;
-        "jigasi") uninstall_jigasi; install_jigasi;;
-        "etherpad") uninstall_etherpad; install_etherpad;;
-        "recording") uninstall_recording_service; install_recording_service;;
-        *) echo "Invalid service. Please try again.";;
-    esac
-}
-
-# Function to read configuration file
-read_config_file() {
-    local config_file=$1
-    if [[ -f $config_file ]]; then
-        source $config_file
+# Set (or uncomment/append) a key=value property in a properties file.
+# Values here are validated IP addresses, so a plain sed replacement is safe.
+set_property() {
+    local key=$1 value=$2 file=$3
+    if grep -q "^${key}=" "$file" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=${value}|" "$file"
+    elif grep -q "^#[[:space:]]*${key}=" "$file" 2>/dev/null; then
+        sed -i "s|^#[[:space:]]*${key}=.*|${key}=${value}|" "$file"
     else
-        display_error "Configuration file not found: $config_file"
+        echo "${key}=${value}" >>"$file"
     fi
 }
 
-# Function to create configuration file
+# --- Validation -------------------------------------------------------------
+valid_ip() {
+    local ip=$1
+    local -a octets
+    IFS='.' read -r -a octets <<<"$ip"
+    [[ ${#octets[@]} -eq 4 ]] || return 1
+    local octet
+    for octet in "${octets[@]}"; do
+        [[ $octet =~ ^[0-9]+$ ]] || return 1
+        ((octet >= 0 && octet <= 255)) || return 1
+    done
+    return 0
+}
+
+valid_fqdn() {
+    [[ $1 =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]
+}
+
+# --- Configuration ----------------------------------------------------------
 create_config_file() {
     echo "Creating configuration file..."
-    if [[ -f $config_file ]]; then
-        read -p "Configuration file already exists. Do you want to overwrite it? (y/n): " overwrite
-        if [[ $overwrite != "y" ]]; then
-            echo "Aborting configuration file creation."
+    if [[ -f $CONFIG_FILE ]]; then
+        read -rp "Configuration file already exists. Overwrite it? (y/N): " overwrite
+        if [[ ${overwrite,,} != "y" ]]; then
+            echo "Keeping existing configuration."
             return
         fi
     fi
-    read -p "Enter local IP address: " local_ip
-    if [[ ! $local_ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        display_error "Invalid local IP address: $local_ip"
+
+    read -rp "Enter local IP address: " local_ip
+    valid_ip "$local_ip" || die "Invalid local IP address: $local_ip"
+
+    read -rp "Enter public IP address: " public_ip
+    valid_ip "$public_ip" || die "Invalid public IP address: $public_ip"
+
+    read -rp "Enter Fully Qualified Domain Name (FQDN): " fqdn
+    valid_fqdn "$fqdn" || die "Invalid FQDN: $fqdn"
+
+    read -rp "Is this server behind NAT? (y/N): " nat_answer
+    if [[ ${nat_answer,,} == "y" ]]; then
+        behind_nat="yes"
+    else
+        behind_nat="no"
     fi
-    read -p "Enter public IP address: " public_ip
-    if [[ ! $public_ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        display_error "Invalid public IP address: $public_ip"
-    fi
-    read -p "Enter Fully Qualified Domain Name (FQDN): " fqdn
-    if [[ -z $fqdn ]]; then
-        display_error "FQDN cannot be empty."
-    fi
-    read -sp "Enter root password: " root_password
-    echo "local_ip=\"$local_ip\"" > "$config_file"
-    echo "public_ip=\"$public_ip\"" >> "$config_file"
-    echo "fqdn=\"$fqdn\"" >> "$config_file"
-    echo "root_password=\"$root_password\"" >> "$config_file"
-    echo "Configuration file created at $config_file"
+
+    # Restrict permissions before writing anything.
+    umask 077
+    cat >"$CONFIG_FILE" <<EOF
+local_ip="$local_ip"
+public_ip="$public_ip"
+fqdn="$fqdn"
+behind_nat="$behind_nat"
+EOF
+    chmod 600 "$CONFIG_FILE"
+    log_message "Configuration file created at $CONFIG_FILE"
 }
 
-# Function to display menu
+# Parse the config file without `source`ing it, so a tampered config cannot
+# execute arbitrary code. Only known keys are imported.
+read_config_file() {
+    [[ -f $CONFIG_FILE ]] || die "Configuration file not found: $CONFIG_FILE. Create it first (menu option 1)."
+    local key value
+    while IFS='=' read -r key value; do
+        # Strip surrounding quotes and whitespace.
+        value=${value%\"}
+        value=${value#\"}
+        case "$key" in
+            local_ip) local_ip=$value ;;
+            public_ip) public_ip=$value ;;
+            fqdn) fqdn=$value ;;
+            behind_nat) behind_nat=$value ;;
+        esac
+    done <"$CONFIG_FILE"
+
+    valid_ip "$local_ip" || die "Configuration has an invalid local_ip: $local_ip"
+    valid_ip "$public_ip" || die "Configuration has an invalid public_ip: $public_ip"
+    valid_fqdn "$fqdn" || die "Configuration has an invalid fqdn: $fqdn"
+}
+
+# --- Jitsi ------------------------------------------------------------------
+setup_jitsi_repo() {
+    log_message "Configuring the Jitsi APT repository..."
+    install_package apt-transport-https ca-certificates curl gnupg
+    install -d -m 0755 "$KEYRING_DIR"
+    # Store the signing key in its own keyring and pin it to the Jitsi repo
+    # only (apt-key is deprecated and trusts the key globally).
+    curl -fsSL https://download.jitsi.org/jitsi-key.gpg.key | gpg --dearmor --yes -o "$JITSI_KEYRING"
+    chmod 0644 "$JITSI_KEYRING"
+    echo "deb [signed-by=${JITSI_KEYRING}] https://download.jitsi.org stable/" >"$JITSI_SOURCES"
+    apt-get update
+}
+
+configure_jitsi_nat() {
+    log_message "Configuring Jitsi videobridge for NAT..."
+    [[ -f $VIDEOBRIDGE_PROPS ]] || die "Videobridge properties not found: $VIDEOBRIDGE_PROPS"
+    set_property "org.ice4j.ice.harvest.NAT_HARVESTER_LOCAL_ADDRESS" "$local_ip" "$VIDEOBRIDGE_PROPS"
+    set_property "org.ice4j.ice.harvest.NAT_HARVESTER_PUBLIC_ADDRESS" "$public_ip" "$VIDEOBRIDGE_PROPS"
+    restart_service "jitsi-videobridge2"
+}
+
+install_jitsi() {
+    read_config_file
+    log_message "Installing Jitsi Meet and Jibri..."
+    setup_jitsi_repo
+    # Preseed the hostname so the package install is non-interactive.
+    echo "jitsi-videobridge jitsi-videobridge/jvb-hostname string $fqdn" | debconf-set-selections
+    apt-get install -y jitsi-meet jibri
+    if ! /usr/share/jitsi-meet/scripts/install-letsencrypt-cert.sh; then
+        log_message "Let's Encrypt certificate step did not complete; configure TLS manually." "WARN"
+    fi
+    if [[ ${behind_nat} == "yes" ]]; then
+        configure_jitsi_nat
+    else
+        log_message "Server is not behind NAT; skipping NAT harvester configuration."
+    fi
+    log_message "Jitsi Meet installation complete."
+    log_message "NEXT STEPS: open firewall ports 80/tcp, 443/tcp, 10000/udp (and 22/tcp for SSH)," "WARN"
+    log_message "and enable the secure domain so only authorized users can create rooms." "WARN"
+    log_message "See the README (Firewall configuration / Authentication sections) for details." "WARN"
+}
+
+# --- Jigasi -----------------------------------------------------------------
+install_jigasi() {
+    log_message "Installing Jigasi..."
+    if [[ ! -f $JITSI_SOURCES ]]; then
+        setup_jitsi_repo
+    fi
+    install_package jigasi
+}
+
+# --- Etherpad ---------------------------------------------------------------
+create_etherpad_service() {
+    cat >"$ETHERPAD_SERVICE" <<EOF
+[Unit]
+Description=Etherpad collaborative editor
+After=network.target
+
+[Service]
+Type=simple
+User=${ETHERPAD_USER}
+Group=${ETHERPAD_USER}
+WorkingDirectory=${ETHERPAD_HOME}
+ExecStart=${ETHERPAD_HOME}/bin/run.sh
+Restart=on-failure
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 0644 "$ETHERPAD_SERVICE"
+}
+
+install_etherpad() {
+    log_message "Installing Etherpad..."
+    install_package git curl
+
+    # Etherpad requires a modern Node.js (18+). Install from NodeSource if a
+    # suitable node binary is not already present.
+    if ! command -v node >/dev/null 2>&1; then
+        log_message "Installing Node.js from NodeSource..."
+        curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+        install_package nodejs
+    fi
+
+    # Run Etherpad as a dedicated, unprivileged system user.
+    if ! id -u "$ETHERPAD_USER" >/dev/null 2>&1; then
+        useradd --system --create-home --home-dir "$ETHERPAD_HOME" \
+            --shell /usr/sbin/nologin "$ETHERPAD_USER"
+    fi
+
+    if [[ ! -d "$ETHERPAD_HOME/.git" ]]; then
+        git clone "$ETHERPAD_REPO" "$ETHERPAD_HOME"
+    fi
+    chown -R "$ETHERPAD_USER:$ETHERPAD_USER" "$ETHERPAD_HOME"
+
+    # Install dependencies as the etherpad user (not root).
+    runuser -u "$ETHERPAD_USER" -- bash -c "cd '$ETHERPAD_HOME' && ./bin/installDeps.sh"
+
+    create_etherpad_service
+    systemctl daemon-reload
+    systemctl enable --now etherpad
+    log_message "Etherpad installed and running as a systemd service (user: $ETHERPAD_USER)."
+}
+
+# --- Recording prerequisites ------------------------------------------------
+install_recording_service() {
+    log_message "Installing recording prerequisites (TURN + tokens)..."
+    if [[ ! -f $JITSI_SOURCES ]]; then
+        setup_jitsi_repo
+    fi
+    install_package jitsi-meet-tokens jitsi-meet-turnserver
+    log_message "Recording prerequisites installed. Configure Jibri separately to enable recording."
+}
+
+# --- Uninstallers -----------------------------------------------------------
+uninstall_jitsi() {
+    log_message "Uninstalling Jitsi..."
+    apt-get purge -y jitsi-meet jicofo jitsi-videobridge2 jibri || true
+    apt-get autoremove -y
+    rm -f "$JITSI_SOURCES" "$JITSI_KEYRING"
+}
+
+uninstall_jigasi() {
+    log_message "Uninstalling Jigasi..."
+    apt-get purge -y jigasi || true
+    apt-get autoremove -y
+}
+
+uninstall_etherpad() {
+    log_message "Uninstalling Etherpad..."
+    if service_exists etherpad; then
+        systemctl disable --now etherpad || true
+    fi
+    rm -f "$ETHERPAD_SERVICE"
+    systemctl daemon-reload || true
+    if id -u "$ETHERPAD_USER" >/dev/null 2>&1; then
+        userdel --remove "$ETHERPAD_USER" || true
+    fi
+    rm -rf "$ETHERPAD_HOME"
+    # System Node.js and git are intentionally left in place; other software
+    # may depend on them.
+    log_message "Etherpad removed. System Node.js and git were left intact."
+}
+
+uninstall_recording_service() {
+    log_message "Uninstalling recording prerequisites..."
+    apt-get purge -y jitsi-meet-tokens jitsi-meet-turnserver || true
+    apt-get autoremove -y
+}
+
+reinstall_service() {
+    local service=$1
+    case $service in
+        jitsi) uninstall_jitsi; install_jitsi ;;
+        jigasi) uninstall_jigasi; install_jigasi ;;
+        etherpad) uninstall_etherpad; install_etherpad ;;
+        recording) uninstall_recording_service; install_recording_service ;;
+        *) echo "Invalid service: $service" ;;
+    esac
+}
+
+# --- Menu -------------------------------------------------------------------
 display_menu() {
-    echo "1. Create configuration file"
-    echo "2. Install Jitsi"
-    echo "3. Install Jigasi"
-    echo "4. Install Etherpad"
-    echo "5. Install Recording Service"
-    echo "6. Uninstall Jitsi"
-    echo "7. Uninstall Jigasi"
-    echo "8. Uninstall Etherpad"
-    echo "9. Uninstall Recording Service"
-    echo "10. Reinstall Jitsi"
-    echo "11. Reinstall Jigasi"
-    echo "12. Reinstall Etherpad"
-    echo "13. Reinstall Recording Service"
-    echo "14. Exit"
-    local valid_options=("1" "2" "3" "4" "5" "6" "7" "8" "9" "10" "11" "12" "13" "14")
-    while true; do
-        read -p "Please select an option: " menu_option
-        if [[ ! " ${valid_options[@]} " =~ " ${menu_option} " ]]; then
-            echo "Invalid option. Please try again."
-        else
-            break
-        fi
-    done
+    cat <<'EOF'
+
+===== Jitsi Suite Installer =====
+ 1) Create/update configuration file
+ 2) Install Jitsi (Meet, Jicofo, Videobridge, Jibri)
+ 3) Install Jigasi
+ 4) Install Etherpad
+ 5) Install recording prerequisites (TURN + tokens)
+ 6) Uninstall Jitsi
+ 7) Uninstall Jigasi
+ 8) Uninstall Etherpad
+ 9) Uninstall recording prerequisites
+10) Reinstall Jitsi
+11) Reinstall Jigasi
+12) Reinstall Etherpad
+13) Reinstall recording prerequisites
+14) Exit
+EOF
 }
 
-# Main function
+# --- Main -------------------------------------------------------------------
 main() {
-    # Get the current date and time
-    start_time=$(date)
-    # Print the start time
-    log_message "Script started at: $start_time" "INFO"
+    require_root
+    log_message "Script started."
 
-    local config_file="/root/jitsi_configuration"
-    if [[ ! -f $config_file ]]; then
-        create_config_file $config_file
-    fi
-    read_config_file $config_file
-
-    # Update System
-    log_message "Updating system..." "INFO"
-    sudo apt update
-    check_command
-    sudo apt upgrade -y
-    check_command
-
-    # Display menu
-    local menu_option
+    local choice
     while true; do
         display_menu
-        case $menu_option in
-            1) create_config_file;;
-            2) read_config_file $CONFIG_FILE; install_jitsi;;
-            3) read_config_file $CONFIG_FILE; read -p "Install Jigasi? (y/n): " install_jigasi_option; if [[ $install_jigasi_option == "y" ]]; then install_jigasi; fi;;
-             4) read_config_file $CONFIG_FILE; install_etherpad;;
-             5) read_config_file $CONFIG_FILE; install_recording_service;;
-            6) read_config_file $CONFIG_FILE; uninstall_jitsi;;
-            7) read_config_file $CONFIG_FILE; uninstall_jigasi;;
-            8) read_config_file $CONFIG_FILE; uninstall_etherpad;;
-             9) read_config_file $CONFIG_FILE; uninstall_recording_service;;
-            10) read_config_file $CONFIG_FILE; reinstall_service "jitsi";;
-            11) read_config_file $CONFIG_FILE; reinstall_service "jigasi";;
-            12) read_config_file $CONFIG_FILE; reinstall_service "etherpad";;
-            13) read_config_file $CONFIG_FILE; reinstall_service "recording";;
-            14) break;;
-            *) echo "Invalid option. Please try again.";;
+        read -rp "Select an option [1-14]: " choice
+        case "$choice" in
+            1) create_config_file ;;
+            2) install_jitsi ;;
+            3)
+                read -rp "Install Jigasi? (y/N): " confirm
+                [[ ${confirm,,} == "y" ]] && install_jigasi
+                ;;
+            4) install_etherpad ;;
+            5) install_recording_service ;;
+            6) uninstall_jitsi ;;
+            7) uninstall_jigasi ;;
+            8) uninstall_etherpad ;;
+            9) uninstall_recording_service ;;
+            10) reinstall_service jitsi ;;
+            11) reinstall_service jigasi ;;
+            12) reinstall_service etherpad ;;
+            13) reinstall_service recording ;;
+            14) log_message "Exiting."; break ;;
+            *) echo "Invalid option. Please choose 1-14." ;;
         esac
     done
 
-    # Get the current date and time 
-    end_time=$(date)
-    # Print the end time
-    log_message "Script ended at: $end_time" "INFO"
+    log_message "Script finished."
 }
 
-# Run the main function
-main
+main "$@"
