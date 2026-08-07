@@ -35,15 +35,15 @@ You'll be presented with a menu:
  2) Install Jitsi (Meet, Jicofo, Videobridge, Jibri)
  3) Install Jigasi
  4) Install Etherpad
- 5) Install recording prerequisites (TURN + tokens)
+ 5) Install TURN server + JWT token support
  6) Uninstall Jitsi
  7) Uninstall Jigasi
  8) Uninstall Etherpad
- 9) Uninstall recording prerequisites
+ 9) Uninstall TURN + JWT token support
 10) Reinstall Jitsi
 11) Reinstall Jigasi
 12) Reinstall Etherpad
-13) Reinstall recording prerequisites
+13) Reinstall TURN + JWT token support
 14) Exit
 ```
 
@@ -54,23 +54,50 @@ You'll be presented with a menu:
 - **FQDN** — the fully qualified domain name for Jitsi Meet.
 - **Behind NAT?** — if yes, the videobridge is configured with the local and
   public NAT harvester addresses.
+- **Let's Encrypt email** — optional; when set, the certificate step runs
+  unattended. Leave empty to configure TLS manually.
 
 The configuration is stored at `/etc/jitsi_script.conf` with `0600`
 permissions (root-only). Actions are logged to `/var/log/jitsi_script.log`.
+
+### Headless (flag-driven) mode
+
+Every action is also available non-interactively, for unattended deploys and
+configuration management:
+
+```bash
+# Write the config file without prompts:
+sudo ./install.sh --configure --local-ip 10.0.0.5 --public-ip 203.0.113.7 \
+    --fqdn meet.example.com --behind-nat --le-email admin@example.com
+
+# Then install components (actions run in the order given):
+sudo ./install.sh --install-jitsi --install-etherpad
+
+# Dedicated recording host (Jibri only, no Jitsi Meet):
+sudo ./install.sh --install-jibri
+```
+
+Run `./install.sh --help` for the full flag list.
 
 ## Notes on the components
 
 - **Jitsi (option 2)** installs Jitsi Meet and Jibri from the official Jitsi
   APT repository and attempts to obtain a Let's Encrypt certificate. NAT
   configuration is applied only when you indicated the server is behind NAT.
-- **Etherpad (option 4)** is installed into `/opt/etherpad`, run as a
-  dedicated unprivileged `etherpad` system user, and managed by a hardened
-  `etherpad.service` systemd unit (so it restarts on failure and survives
-  reboots). Node.js is installed from NodeSource if a suitable version isn't
-  already present.
-- **Recording prerequisites (option 5)** install `jitsi-meet-turnserver` and
-  `jitsi-meet-tokens`. Jibri must be configured separately to enable
-  recording.
+- **Etherpad (option 4)** installs a **pinned release** (see
+  `ETHERPAD_VERSION` in the script) into `/opt/etherpad`, run as a dedicated
+  unprivileged `etherpad` system user, and managed by a hardened
+  `etherpad.service` systemd unit. Node.js is installed from NodeSource when
+  the present major is older than the pinned release requires, and `pnpm` is
+  provided system-wide (Etherpad's own bootstrap cannot install it as an
+  unprivileged user). `settings.json` is seeded from the template with
+  `trustProxy` enabled — always front it with a TLS reverse proxy.
+- **TURN + JWT tokens (option 5)** install `jitsi-meet-turnserver` and
+  `jitsi-meet-tokens`. The JWT app ID/secret are preseeded automatically and
+  recorded in `/etc/jitsi_script.conf`. Note these are **not** Jibri
+  prerequisites: TURN helps clients behind restrictive NATs, and tokens
+  enable JWT auth (e.g. for embedding Jitsi in Matrix or Nextcloud). Jibri
+  must be configured separately to enable recording.
 
 ## Firewall configuration
 

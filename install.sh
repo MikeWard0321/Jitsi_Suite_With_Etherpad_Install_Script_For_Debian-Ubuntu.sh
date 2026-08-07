@@ -22,6 +22,11 @@ CONFIG_FILE="/etc/jitsi_script.conf"
 ETHERPAD_USER="etherpad"
 ETHERPAD_HOME="/opt/etherpad"
 ETHERPAD_REPO="https://github.com/ether/etherpad-lite.git"
+# Pin a release tag: the default branch (develop) is a moving target and its
+# toolchain requirements change without notice.
+ETHERPAD_VERSION="v3.3.3"
+# Node.js major required by the pinned Etherpad release (package.json engines).
+NODE_MAJOR_REQUIRED=24
 ETHERPAD_SERVICE="/etc/systemd/system/etherpad.service"
 
 # Configuration values (populated by read_config_file).
@@ -29,6 +34,7 @@ local_ip=""
 public_ip=""
 fqdn=""
 behind_nat="no"
+le_email=""
 
 # --- Logging / error handling ----------------------------------------------
 # A single, consistent error strategy: `set -e` aborts on any unchecked
@@ -64,7 +70,7 @@ require_root() {
 
 # --- Generic helpers --------------------------------------------------------
 install_package() {
-    apt-get install -y "$@"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
 }
 
 service_exists() {
@@ -139,6 +145,12 @@ create_config_file() {
         behind_nat="no"
     fi
 
+    read -rp "Email for Let's Encrypt registration (empty = configure TLS manually): " le_email
+
+    write_config_file
+}
+
+write_config_file() {
     # Restrict permissions before writing anything.
     umask 077
     cat >"$CONFIG_FILE" <<EOF
@@ -146,6 +158,7 @@ local_ip="$local_ip"
 public_ip="$public_ip"
 fqdn="$fqdn"
 behind_nat="$behind_nat"
+le_email="$le_email"
 EOF
     chmod 600 "$CONFIG_FILE"
     log_message "Configuration file created at $CONFIG_FILE"
@@ -165,6 +178,7 @@ read_config_file() {
             public_ip) public_ip=$value ;;
             fqdn) fqdn=$value ;;
             behind_nat) behind_nat=$value ;;
+            le_email) le_email=$value ;;
         esac
     done <"$CONFIG_FILE"
 
@@ -200,9 +214,15 @@ install_jitsi() {
     setup_jitsi_repo
     # Preseed the hostname so the package install is non-interactive.
     echo "jitsi-videobridge jitsi-videobridge/jvb-hostname string $fqdn" | debconf-set-selections
-    apt-get install -y jitsi-meet jibri
-    if ! /usr/share/jitsi-meet/scripts/install-letsencrypt-cert.sh; then
-        log_message "Let's Encrypt certificate step did not complete; configure TLS manually." "WARN"
+    install_package jitsi-meet jibri
+    # The Let's Encrypt helper prompts for a registration email on stdin; feed
+    # it from the config when provided so the install can run unattended.
+    if [[ -n ${le_email} ]]; then
+        if ! echo "$le_email" | /usr/share/jitsi-meet/scripts/install-letsencrypt-cert.sh; then
+            log_message "Let's Encrypt certificate step did not complete; configure TLS manually." "WARN"
+        fi
+    else
+        log_message "No le_email configured; skipping Let's Encrypt (self-signed cert in place). Configure TLS manually." "WARN"
     fi
     if [[ ${behind_nat} == "yes" ]]; then
         configure_jitsi_nat
@@ -213,6 +233,19 @@ install_jitsi() {
     log_message "NEXT STEPS: open firewall ports 80/tcp, 443/tcp, 10000/udp (and 22/tcp for SSH)," "WARN"
     log_message "and enable the secure domain so only authorized users can create rooms." "WARN"
     log_message "See the README (Firewall configuration / Authentication sections) for details." "WARN"
+}
+
+# --- Jibri (standalone) -----------------------------------------------------
+# For dedicated recording hosts: installs ONLY the Jibri package (plus the
+# repo), without Jitsi Meet. Pointing it at the conference host is a separate
+# configuration step (XMPP accounts, jibri.conf, brewery MUC).
+install_jibri_standalone() {
+    log_message "Installing Jibri (standalone recording host)..."
+    if [[ ! -f $JITSI_SOURCES ]]; then
+        setup_jitsi_repo
+    fi
+    install_package jibri
+    log_message "Jibri installed. Configure /etc/jitsi/jibri/jibri.conf before enabling."
 }
 
 # --- Jigasi -----------------------------------------------------------------
@@ -250,28 +283,60 @@ EOF
     chmod 0644 "$ETHERPAD_SERVICE"
 }
 
+node_major() {
+    command -v node >/dev/null 2>&1 || return 1
+    local v
+    v=$(node --version 2>/dev/null) || return 1
+    v=${v#v}
+    echo "${v%%.*}"
+}
+
 install_etherpad() {
-    log_message "Installing Etherpad..."
+    log_message "Installing Etherpad ${ETHERPAD_VERSION}..."
     install_package git curl
 
-    # Etherpad requires a modern Node.js (18+). Install from NodeSource if a
-    # suitable node binary is not already present.
-    if ! command -v node >/dev/null 2>&1; then
-        log_message "Installing Node.js from NodeSource..."
-        curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+    # Etherpad's pinned release declares the Node.js major it needs. An
+    # existing but too-old node must not short-circuit this: check the
+    # version, not mere presence.
+    local current_major
+    current_major=$(node_major || echo 0)
+    if (( current_major < NODE_MAJOR_REQUIRED )); then
+        log_message "Installing Node.js ${NODE_MAJOR_REQUIRED}.x from NodeSource (found major: ${current_major})..."
+        curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR_REQUIRED}.x" | bash -
         install_package nodejs
     fi
 
-    # Run Etherpad as a dedicated, unprivileged system user.
-    if ! id -u "$ETHERPAD_USER" >/dev/null 2>&1; then
-        useradd --system --create-home --home-dir "$ETHERPAD_HOME" \
-            --shell /usr/sbin/nologin "$ETHERPAD_USER"
+    # Etherpad's installDeps.sh tries `npm install pnpm -g` when pnpm is
+    # missing, which fails for the unprivileged service user. Provide pnpm
+    # system-wide as root instead.
+    if ! command -v pnpm >/dev/null 2>&1; then
+        npm install -g pnpm
     fi
 
+    # Run Etherpad as a dedicated, unprivileged system user. Do NOT let
+    # useradd create the home directory: it would copy /etc/skel into it and
+    # git refuses to clone into a non-empty directory.
+    if ! id -u "$ETHERPAD_USER" >/dev/null 2>&1; then
+        useradd --system --home-dir "$ETHERPAD_HOME" \
+            --shell /usr/sbin/nologin "$ETHERPAD_USER"
+    fi
+    install -d -o "$ETHERPAD_USER" -g "$ETHERPAD_USER" "$ETHERPAD_HOME"
+
     if [[ ! -d "$ETHERPAD_HOME/.git" ]]; then
-        git clone "$ETHERPAD_REPO" "$ETHERPAD_HOME"
+        git clone --branch "$ETHERPAD_VERSION" --depth 1 "$ETHERPAD_REPO" "$ETHERPAD_HOME"
+    else
+        git -C "$ETHERPAD_HOME" fetch --depth 1 origin tag "$ETHERPAD_VERSION"
+        git -C "$ETHERPAD_HOME" checkout "$ETHERPAD_VERSION"
     fi
     chown -R "$ETHERPAD_USER:$ETHERPAD_USER" "$ETHERPAD_HOME"
+
+    # Seed settings.json from the template and trust the local reverse proxy;
+    # Etherpad must never be exposed on :9001 directly.
+    if [[ ! -f "$ETHERPAD_HOME/settings.json" ]]; then
+        runuser -u "$ETHERPAD_USER" -- \
+            cp "$ETHERPAD_HOME/settings.json.template" "$ETHERPAD_HOME/settings.json"
+        sed -i 's|"trustProxy": false|"trustProxy": true|' "$ETHERPAD_HOME/settings.json"
+    fi
 
     # Install dependencies as the etherpad user (not root).
     runuser -u "$ETHERPAD_USER" -- bash -c "cd '$ETHERPAD_HOME' && ./bin/installDeps.sh"
@@ -279,17 +344,32 @@ install_etherpad() {
     create_etherpad_service
     systemctl daemon-reload
     systemctl enable --now etherpad
-    log_message "Etherpad installed and running as a systemd service (user: $ETHERPAD_USER)."
+    log_message "Etherpad ${ETHERPAD_VERSION} installed and running as a systemd service (user: $ETHERPAD_USER)."
 }
 
-# --- Recording prerequisites ------------------------------------------------
+# --- TURN + JWT tokens ------------------------------------------------------
+# Note: neither package is a Jibri prerequisite. TURN helps clients behind
+# restrictive NATs; jitsi-meet-tokens enables JWT auth (e.g. for embedding in
+# Matrix/Nextcloud). Installing tokens switches Prosody to token auth, so the
+# app ID/secret are preseeded here and recorded in the config file.
 install_recording_service() {
-    log_message "Installing recording prerequisites (TURN + tokens)..."
+    read_config_file
+    log_message "Installing TURN server + JWT token support..."
     if [[ ! -f $JITSI_SOURCES ]]; then
         setup_jitsi_repo
     fi
+    local app_id="jitsi" app_secret
+    app_secret=$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 32)
+    echo "jitsi-meet-tokens jitsi-meet-tokens/appid string ${app_id}" | debconf-set-selections
+    echo "jitsi-meet-tokens jitsi-meet-tokens/appsecret password ${app_secret}" | debconf-set-selections
     install_package jitsi-meet-tokens jitsi-meet-turnserver
-    log_message "Recording prerequisites installed. Configure Jibri separately to enable recording."
+    umask 077
+    {
+        echo "jwt_app_id=\"${app_id}\""
+        echo "jwt_app_secret=\"${app_secret}\""
+    } >>"$CONFIG_FILE"
+    log_message "JWT app ID/secret recorded in ${CONFIG_FILE} (mode 0600)."
+    log_message "TURN + token support installed. Configure Jibri separately to enable recording."
 }
 
 # --- Uninstallers -----------------------------------------------------------
@@ -323,7 +403,7 @@ uninstall_etherpad() {
 }
 
 uninstall_recording_service() {
-    log_message "Uninstalling recording prerequisites..."
+    log_message "Uninstalling TURN + JWT token support..."
     apt-get purge -y jitsi-meet-tokens jitsi-meet-turnserver || true
     apt-get autoremove -y
 }
@@ -348,23 +428,88 @@ display_menu() {
  2) Install Jitsi (Meet, Jicofo, Videobridge, Jibri)
  3) Install Jigasi
  4) Install Etherpad
- 5) Install recording prerequisites (TURN + tokens)
+ 5) Install TURN server + JWT token support
  6) Uninstall Jitsi
  7) Uninstall Jigasi
  8) Uninstall Etherpad
- 9) Uninstall recording prerequisites
+ 9) Uninstall TURN + JWT token support
 10) Reinstall Jitsi
 11) Reinstall Jigasi
 12) Reinstall Etherpad
-13) Reinstall recording prerequisites
+13) Reinstall TURN + JWT token support
 14) Exit
 EOF
+}
+
+# --- Headless (flag-driven) mode --------------------------------------------
+usage() {
+    cat <<'EOF'
+Usage: install.sh [options]           (no options = interactive menu)
+
+Configuration (writes /etc/jitsi_script.conf non-interactively):
+  --configure --local-ip IP --public-ip IP --fqdn FQDN
+              [--behind-nat] [--le-email EMAIL]
+
+Actions (run in the order given):
+  --install-jitsi       Install Jitsi Meet + Jibri packages
+  --install-jibri       Install ONLY Jibri (dedicated recording host)
+  --install-jigasi      Install Jigasi
+  --install-etherpad    Install Etherpad (pinned release, systemd service)
+  --install-tokens      Install TURN server + JWT token support
+  --uninstall-jitsi | --uninstall-jigasi | --uninstall-etherpad | --uninstall-tokens
+  --help                Show this help
+EOF
+}
+
+run_headless() {
+    local do_configure="no"
+    local -a actions=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --configure) do_configure="yes" ;;
+            --local-ip) local_ip=$2; shift ;;
+            --public-ip) public_ip=$2; shift ;;
+            --fqdn) fqdn=$2; shift ;;
+            --behind-nat) behind_nat="yes" ;;
+            --le-email) le_email=$2; shift ;;
+            --install-jitsi) actions+=(install_jitsi) ;;
+            --install-jibri) actions+=(install_jibri_standalone) ;;
+            --install-jigasi) actions+=(install_jigasi) ;;
+            --install-etherpad) actions+=(install_etherpad) ;;
+            --install-tokens|--install-recording) actions+=(install_recording_service) ;;
+            --uninstall-jitsi) actions+=(uninstall_jitsi) ;;
+            --uninstall-jigasi) actions+=(uninstall_jigasi) ;;
+            --uninstall-etherpad) actions+=(uninstall_etherpad) ;;
+            --uninstall-tokens|--uninstall-recording) actions+=(uninstall_recording_service) ;;
+            --help|-h) usage; exit 0 ;;
+            *) usage; die "Unknown option: $1" ;;
+        esac
+        shift
+    done
+
+    if [[ $do_configure == "yes" ]]; then
+        valid_ip "$local_ip" || die "Invalid or missing --local-ip"
+        valid_ip "$public_ip" || die "Invalid or missing --public-ip"
+        valid_fqdn "$fqdn" || die "Invalid or missing --fqdn"
+        write_config_file
+    fi
+
+    local action
+    for action in "${actions[@]}"; do
+        "$action"
+    done
 }
 
 # --- Main -------------------------------------------------------------------
 main() {
     require_root
     log_message "Script started."
+
+    if [[ $# -gt 0 ]]; then
+        run_headless "$@"
+        log_message "Script finished."
+        return
+    fi
 
     local choice
     while true; do
