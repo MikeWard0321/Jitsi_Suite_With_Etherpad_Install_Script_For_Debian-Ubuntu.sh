@@ -344,9 +344,10 @@ install_etherpad() {
 
     # Etherpad's installDeps.sh tries `npm install pnpm -g` when pnpm is
     # missing, which fails for the unprivileged service user. Provide pnpm
-    # system-wide as root instead.
+    # system-wide instead. Prefer corepack (ships with Node, robust in
+    # restricted/unattended environments); fall back to a global npm install.
     if ! command -v pnpm >/dev/null 2>&1; then
-        npm install -g pnpm
+        corepack enable pnpm 2>/dev/null || npm install -g pnpm
     fi
 
     # Run Etherpad as a dedicated, unprivileged system user. Do NOT let
