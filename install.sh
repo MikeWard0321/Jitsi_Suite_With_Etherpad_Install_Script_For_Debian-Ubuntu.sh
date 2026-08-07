@@ -657,19 +657,24 @@ configure_jibri() {
     [[ -n $jibri_pw && -n $recorder_pw ]] || die "configure_jibri: --jibri-password and --recorder-password required."
 
     log_message "Configuring Jibri to record ${meet_fqdn} into ${rec_dir}..."
+    # Ensure a permissive umask so the APT keyring below is world-readable
+    # (apt verifies repository signatures as the unprivileged _apt user).
+    umask 022
     if [[ ! -f $JITSI_SOURCES ]]; then
         setup_jitsi_repo
     fi
-    install_package jibri ffmpeg unzip curl "linux-image-extra-virtual" 2>/dev/null || \
+    # snd-aloop ships in linux-modules-extra, which cloud kernels omit.
+    install_package jibri ffmpeg unzip curl "linux-modules-extra-$(uname -r)" 2>/dev/null || \
         install_package jibri ffmpeg unzip curl
 
     # ALSA loopback for audio capture.
     echo snd-aloop >/etc/modules-load.d/snd-aloop.conf
-    modprobe snd-aloop || log_message "modprobe snd-aloop failed; a reboot may be needed." "WARN"
+    modprobe snd-aloop || log_message "modprobe snd-aloop failed; recording audio needs it (reboot if just installed)." "WARN"
 
     # Google Chrome + a matching chromedriver.
     install -d -m 0755 "$KEYRING_DIR"
     curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor --yes -o "${KEYRING_DIR}/google-chrome.gpg"
+    chmod 0644 "${KEYRING_DIR}/google-chrome.gpg"
     echo "deb [arch=amd64 signed-by=${KEYRING_DIR}/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" >/etc/apt/sources.list.d/google-chrome.list
     apt-get update
     install_package google-chrome-stable
