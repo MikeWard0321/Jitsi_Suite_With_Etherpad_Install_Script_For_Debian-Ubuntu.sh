@@ -202,9 +202,45 @@ setup_jitsi_repo() {
 
 configure_jitsi_nat() {
     log_message "Configuring Jitsi videobridge for NAT..."
-    [[ -f $VIDEOBRIDGE_PROPS ]] || die "Videobridge properties not found: $VIDEOBRIDGE_PROPS"
-    set_property "org.ice4j.ice.harvest.NAT_HARVESTER_LOCAL_ADDRESS" "$local_ip" "$VIDEOBRIDGE_PROPS"
-    set_property "org.ice4j.ice.harvest.NAT_HARVESTER_PUBLIC_ADDRESS" "$public_ip" "$VIDEOBRIDGE_PROPS"
+    local jvb_conf="/etc/jitsi/videobridge/jvb.conf"
+    if [[ -f $jvb_conf ]]; then
+        # Current videobridge packages use HOCON config; the legacy
+        # sip-communicator.properties is no longer shipped. Duplicate
+        # top-level objects merge in HOCON, so appending is safe; the
+        # marker keeps this idempotent.
+        # allowed-addresses pins the harvester to the configured local
+        # address. Without it, addresses on point-to-point interfaces
+        # (e.g. WireGuard tunnels) are silently skipped, and a NAT that
+        # forwards to such an address delivers media to a port nothing
+        # is bound on.
+        if ! grep -q "installer-managed NAT mapping" "$jvb_conf"; then
+            cat >>"$jvb_conf" <<EOF
+
+// installer-managed NAT mapping (do not duplicate)
+ice4j {
+  harvest {
+    allowed-addresses = [ "${local_ip}" ]
+    mapping {
+      static-mappings = [
+        {
+          local-address = "${local_ip}"
+          public-address = "${public_ip}"
+        }
+      ]
+    }
+  }
+}
+EOF
+        else
+            sed -i "s|allowed-addresses = \[ \".*\" \]|allowed-addresses = [ \"${local_ip}\" ]|; s|local-address = \".*\"|local-address = \"${local_ip}\"|; s|public-address = \".*\"|public-address = \"${public_ip}\"|" "$jvb_conf"
+        fi
+    elif [[ -f $VIDEOBRIDGE_PROPS ]]; then
+        # Legacy fallback for older videobridge packages.
+        set_property "org.ice4j.ice.harvest.NAT_HARVESTER_LOCAL_ADDRESS" "$local_ip" "$VIDEOBRIDGE_PROPS"
+        set_property "org.ice4j.ice.harvest.NAT_HARVESTER_PUBLIC_ADDRESS" "$public_ip" "$VIDEOBRIDGE_PROPS"
+    else
+        die "No videobridge configuration found ($jvb_conf or $VIDEOBRIDGE_PROPS)."
+    fi
     restart_service "jitsi-videobridge2"
 }
 
@@ -324,11 +360,13 @@ install_etherpad() {
 
     if [[ ! -d "$ETHERPAD_HOME/.git" ]]; then
         git clone --branch "$ETHERPAD_VERSION" --depth 1 "$ETHERPAD_REPO" "$ETHERPAD_HOME"
+        chown -R "$ETHERPAD_USER:$ETHERPAD_USER" "$ETHERPAD_HOME"
     else
-        git -C "$ETHERPAD_HOME" fetch --depth 1 origin tag "$ETHERPAD_VERSION"
-        git -C "$ETHERPAD_HOME" checkout "$ETHERPAD_VERSION"
+        # Run git as the owning user: as root it refuses the etherpad-owned
+        # repo ("dubious ownership") and would abort a re-run.
+        runuser -u "$ETHERPAD_USER" -- git -C "$ETHERPAD_HOME" fetch --depth 1 origin tag "$ETHERPAD_VERSION"
+        runuser -u "$ETHERPAD_USER" -- git -C "$ETHERPAD_HOME" checkout "$ETHERPAD_VERSION"
     fi
-    chown -R "$ETHERPAD_USER:$ETHERPAD_USER" "$ETHERPAD_HOME"
 
     # Seed settings.json from the template and trust the local reverse proxy;
     # Etherpad must never be exposed on :9001 directly.
@@ -345,6 +383,61 @@ install_etherpad() {
     systemctl daemon-reload
     systemctl enable --now etherpad
     log_message "Etherpad ${ETHERPAD_VERSION} installed and running as a systemd service (user: $ETHERPAD_USER)."
+
+    integrate_etherpad_with_jitsi
+}
+
+# Wire Etherpad into a Jitsi Meet install on the same host: proxy it under
+# /etherpad/ on the Jitsi nginx vhost (same-origin, so the meeting iframe
+# works without cross-site cookie trouble) and point config.js at it. This is
+# the documented docker-jitsi-meet pattern. No-op when Jitsi is not installed.
+integrate_etherpad_with_jitsi() {
+    [[ -f $CONFIG_FILE ]] || return 0
+    read_config_file
+    local nginx_site="/etc/nginx/sites-available/${fqdn}.conf"
+    local meet_config="/etc/jitsi/meet/${fqdn}-config.js"
+    if [[ ! -f $nginx_site || ! -f $meet_config ]]; then
+        log_message "Jitsi Meet not detected on this host; skipping Etherpad integration."
+        return 0
+    fi
+
+    if ! grep -q "installer-managed etherpad location" "$nginx_site"; then
+        # Insert the proxy location at the top of the server block that holds
+        # the existing app locations (the one with the root directive).
+        awk '
+            /installer-managed/ { print; next }
+            !inserted && /location = \/config.js/ {
+                print "    # installer-managed etherpad location"
+                print "    location ^~ /etherpad/ {"
+                print "        proxy_pass http://127.0.0.1:9001/;"
+                print "        proxy_http_version 1.1;"
+                print "        proxy_set_header Upgrade $http_upgrade;"
+                print "        proxy_set_header Connection \"upgrade\";"
+                print "        proxy_set_header Host $host;"
+                print "        proxy_set_header X-Forwarded-For $remote_addr;"
+                print "        proxy_buffering off;"
+                print "    }"
+                inserted = 1
+            }
+            { print }
+        ' "$nginx_site" >"${nginx_site}.tmp" && mv "${nginx_site}.tmp" "$nginx_site"
+    fi
+
+    if ! grep -q "installer-managed etherpad_base" "$meet_config"; then
+        cat >>"$meet_config" <<EOF
+
+// installer-managed etherpad_base
+config.etherpad_base = 'https://${fqdn}/etherpad/p/';
+EOF
+    fi
+
+    if nginx -t >/dev/null 2>&1; then
+        systemctl reload nginx
+        log_message "Etherpad integrated with Jitsi Meet at https://${fqdn}/etherpad/."
+    else
+        log_message "nginx config test failed after Etherpad integration; NOT reloaded. Inspect ${nginx_site}." "ERROR"
+        return 1
+    fi
 }
 
 # --- TURN + JWT tokens ------------------------------------------------------
