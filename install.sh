@@ -478,11 +478,13 @@ harden_secure_domain() {
     local meet_cfg="/etc/jitsi/meet/${fqdn}-config.js"
     [[ -f $prosody_cfg ]] || die "Prosody config not found: $prosody_cfg (install Jitsi first)."
 
-    # Flip the main domain's VirtualHost to internal auth. Packages ship it as
-    # 'anonymous' or Debian's 'jitsi-anonymous'. Before the guest host is
-    # appended below, that line is the only anonymous auth in the file, so a
-    # global replace is safe (auth./recorder. hosts are already internal_hashed).
-    sed -i 's/authentication = "anonymous"/authentication = "internal_hashed"/; s/authentication = "jitsi-anonymous"/authentication = "internal_hashed"/' "$prosody_cfg"
+    # Flip ONLY the main domain's VirtualHost to internal auth (packages ship it
+    # 'anonymous' or Debian's 'jitsi-anonymous'). The sed is SCOPED to the main
+    # VirtualHost block — from its header to the next VirtualHost/Component — so
+    # a re-run can never flip the anonymous guest vhost we add below. (A global
+    # replace here clobbered guest.<fqdn> on the second run, which forced guests
+    # to authenticate instead of just waiting for a moderator.)
+    sed -i '/^VirtualHost "'"$fqdn"'"/,/^\(VirtualHost\|Component\)/ s/authentication = "\(jitsi-\)\?anonymous"/authentication = "internal_hashed"/' "$prosody_cfg"
     if ! grep -q "VirtualHost \"guest.${fqdn}\"" "$prosody_cfg"; then
         cat >>"$prosody_cfg" <<EOF
 
@@ -491,6 +493,10 @@ VirtualHost "guest.${fqdn}"
     c2s_require_encryption = false
 EOF
     fi
+    # Self-heal: ensure the guest vhost's auth is anonymous (repairs a config
+    # broken by the earlier global-flip, and is a no-op otherwise). Targets the
+    # line immediately after the guest VirtualHost header only.
+    sed -i '/^VirtualHost "guest.'"$fqdn"'"/{n; s/authentication = "internal_hashed"/authentication = "anonymous"/;}' "$prosody_cfg"
 
     if ! grep -q "installer-managed secure domain" "$jicofo"; then
         cat >>"$jicofo" <<EOF
